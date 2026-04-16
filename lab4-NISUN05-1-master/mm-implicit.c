@@ -23,7 +23,7 @@ size_t hdr_size = sizeof(meta_t);
 void 
 set_size_status(meta_t *h, size_t csz, bool allocated)
 {
-    //Your code here
+      h->size_status = csz | (allocated ? 1 : 0);
 }
 
 // helper function to extract the chunk size information from the 
@@ -31,7 +31,7 @@ set_size_status(meta_t *h, size_t csz, bool allocated)
 size_t
 get_size(meta_t *h)
 {
-    //Your code here
+    return h->size_status & ~((size_t)1);
 }
 
 // helper function to extract the status (allocated or free) information 
@@ -39,7 +39,7 @@ get_size(meta_t *h)
 bool
 get_status(meta_t *h)
 {
-    //Your code here
+   return (h->size_status & 1) == 1;
 }
 
 // helper function to set the status information in the header/footer
@@ -47,7 +47,10 @@ get_status(meta_t *h)
 void
 set_status(meta_t *h, bool allocated)
 {
-    //Your code here
+    if (allocated) {
+        h->size_status |= (size_t)1;          // set LSB
+    } else {
+        h->size_status &= ~((size_t)1);  
 }
 
 // helper function that returns a pointer to the footer of a chunk 
@@ -56,7 +59,8 @@ set_status(meta_t *h, bool allocated)
 meta_t *
 header2footer(meta_t *h)
 {
-    //Your code here
+    size_t csz = get_size(h);
+    return (meta_t *)((char *)h + csz - hdr_size);
 }
 
 // helper function that returns a pointer to this chunk's header 
@@ -65,7 +69,7 @@ header2footer(meta_t *h)
 meta_t *
 payload2header(void *p)
 {
-    //Your code here
+     return (meta_t *)((char *)p - hdr_size);
 }
 
 // helper function that returns a pointer to 
@@ -76,7 +80,13 @@ payload2header(void *p)
 meta_t *
 next_chunk_header(meta_t *h)
 {
-    //Your code here
+   size_t csz = get_size(h);
+    meta_t *next = (meta_t *)((char *)h + csz);
+    // If the calculated pointer is at or beyond the high watermark, there is no next chunk
+    if ((void *)next >= mem_heap_hi()) {
+        return NULL;
+    }
+    return next;
 }
 
 // helper function that returns a pointer to the previous (i.e. preceding) chunk's header
@@ -86,7 +96,14 @@ next_chunk_header(meta_t *h)
 meta_t *
 prev_chunk_header(meta_t *h)
 {
-    //Your code here
+    meta_t *first = first_chunk_header();
+    if (h == first) {
+        return NULL;
+    }
+    // The footer of the previous chunk is immediately before this header
+    meta_t *prev_footer = (meta_t *)((char *)h - hdr_size);
+    size_t prev_csz = get_size(prev_footer);
+    return (meta_t *)((char *)h - prev_csz);
 }
 
 // Return a pointer to the first chunk of the implicit list
@@ -127,7 +144,10 @@ ask_os_for_chunk(size_t csz)
 void
 init_chunk(meta_t *p, size_t csz, bool allocated)
 {
-    //Your code here
+     set_size_status(p, csz, allocated);
+    // Set footer (same info as header)
+    meta_t *footer = header2footer(p);
+    set_size_status(footer, csz, allocated);
 }
 
 // mm_init is called to initialize the malloc library
@@ -152,13 +172,31 @@ heap_info_t
 mm_checkheap(bool verbose)
 {
 	heap_info_t info = {0};
-	// Your code here
-	//
-	// traverse the heap to fill in the fields of info
-
-	// correctness of implicit heap amounts to the following assertion:
-	// the sum of all chunk sizes equals the heap size minus the ALIGNMENT/2
-	// padding bytes set up by mm_init.
+ 
+    meta_t *h = first_chunk_header();
+    while (h != NULL) {
+        size_t csz = get_size(h);
+        bool status = get_status(h);
+ 
+        // Verify footer matches header
+        meta_t *footer = header2footer(h);
+        assert(footer->size_status == h->size_status);
+ 
+        if (status) {
+            info.allocated_size += csz;
+            info.allocated_cnt++;
+        } else {
+            info.free_size += csz;
+            info.free_cnt++;
+        }
+ 
+        if (verbose) {
+            printf("  chunk @ %p: size=%zu, %s\n",
+                   (void *)h, csz, status ? "allocated" : "free");
+        }
+ 
+        h = next_chunk_header(h);
+	}
 	assert(mem_heapsize() - ALIGNMENT/2 == (info.allocated_size + info.free_size));
 	return info;
 }
@@ -171,7 +209,14 @@ mm_checkheap(bool verbose)
 meta_t *
 first_fit(size_t csz)
 {
-	//Your code here
+	meta_t *h = first_chunk_header();
+    while (h != NULL) {
+        if (!get_status(h) && get_size(h) >= csz) {
+            return h;
+        }
+        h = next_chunk_header(h);
+    }
+    return NULL;
 }
 
 // helper function to split an allocated chunk into two chunks. 
@@ -181,7 +226,22 @@ first_fit(size_t csz)
 void
 split(meta_t *original, size_t csz)
 {
-	//Your code here
+	 size_t orig_csz = get_size(original);
+    size_t remainder = orig_csz - csz;
+ 
+    // Only split if the remainder is large enough to hold a valid (header+footer) chunk
+    if (remainder < 2 * hdr_size) {
+        // Not enough room to split — leave original size intact
+        return;
+    }
+ 
+    // Shrink the original chunk to csz
+    bool orig_status = get_status(original);
+    init_chunk(original, csz, orig_status);
+ 
+    // Initialize the new free chunk with the remaining bytes
+    meta_t *new_chunk = (meta_t *)((char *)original + csz);
+    init_chunk(new_chunk, remainder, false);
 }
 
 
@@ -191,27 +251,32 @@ split(meta_t *original, size_t csz)
 void *
 mm_malloc(size_t size)
 {
-	//make requested payload size aligned
-	size = align(size);
-	//chunk size is aligned because payload and header+footer size
-	//are both aligned
-	size_t csz = 2*hdr_size + size;
-    
-	//Your code here 
-	//
-	//Your code logic should be:
-	//Try to find a free chunk using helper function first_fit
-	//    If found, split the chunk (using helper function split).
-	//    If not found, ask OS for new memory using helper ask_os_for_chunk
-	//Set the chunk's status to be allocated
-
-
-	//After finishing obtaining free chunk p, 
-	//check heap correctness to catch bugs
-	if (debug) {
-		mm_checkheap(true);
-	}
-	return NULL;
+  / Make requested payload size aligned
+    size = align(size);
+    // Chunk size includes header + footer
+    size_t csz = 2*hdr_size + size;
+ 
+    meta_t *p = first_fit(csz);
+ 
+    if (p != NULL) {
+        // Found a free chunk — split it if possible, then mark allocated
+        split(p, csz);
+        set_status(p, true);
+        set_status(header2footer(p), true);
+    } else {
+        // No suitable free chunk; ask OS for more memory
+        p = ask_os_for_chunk(csz);
+        set_status(p, true);
+        set_status(header2footer(p), true);
+    }
+ 
+    // After finishing obtaining free chunk p,
+    // check heap correctness to catch bugs
+    if (debug) {
+        mm_checkheap(true);
+    }
+    // Return pointer to payload (just after the header)
+    return (void *)((char *)p + hdr_size);
 }
 
 // helper function to merge the current chunk with the next/following chunk
@@ -222,7 +287,15 @@ mm_malloc(size_t size)
 meta_t *
 coalesce_next(meta_t *h)
 {
-    //Your code here
+    meta_t *next = next_chunk_header(h);
+    if (next == NULL || get_status(next)) {
+        // No next chunk, or next chunk is allocated — nothing to merge
+        return h;
+    }
+    // Merge: new size is this chunk + next chunk
+    size_t new_csz = get_size(h) + get_size(next);
+    init_chunk(h, new_csz, false);
+    return h;
 }
 
 // helper function to merge the current chunk with the prev/proceding chunk
@@ -234,7 +307,15 @@ coalesce_next(meta_t *h)
 meta_t *
 coalesce_prev(meta_t *h)
 {
-    //Your code here
+   meta_t *prev = prev_chunk_header(h);
+    if (prev == NULL || get_status(prev)) {
+        // No previous chunk, or previous chunk is allocated — nothing to merge
+        return h;
+    }
+    // Merge: new size is prev chunk + this chunk
+    size_t new_csz = get_size(prev) + get_size(h);
+    init_chunk(prev, new_csz, false);
+    return prev;
 }
 
 
@@ -242,19 +323,24 @@ coalesce_prev(meta_t *h)
 void 
 mm_free(void *p)
 {
-	// Your code here
-	//
-	// The code logic should be:
-	// 1. Obtain pointer to current chunk's header using helper payload2header
-	// 2. Set current chunk's status (header AND footer) to "free"
-	// 3. Call coalesce_next() to merge with the next chunk if it is free
-	// 4. Call coalesce_prev() to merge with the previous chunk if it is free
-	  
-	  
-	// After freeing the chunk, check heap correctness to catch bugs
-	if (debug) {
-		mm_checkheap(true);
-	}
+	// 1. Obtain pointer to current chunk's header
+    meta_t *h = payload2header(p);
+ 
+    // 2. Set current chunk's status (header AND footer) to "free"
+    set_status(h, false);
+    set_status(header2footer(h), false);
+ 
+    // 3. Coalesce with next chunk if it is free
+    h = coalesce_next(h);
+ 
+    // 4. Coalesce with previous chunk if it is free
+    h = coalesce_prev(h);
+    (void)h; // suppress unused variable warning
+ 
+    // After freeing the chunk, check heap correctness to catch bugs
+    if (debug) {
+        mm_checkheap(true);
+    }
 }	
 
 // mm_realloc changes the size of a previous allocation (pointed to by ptr) to size bytes,  
@@ -268,13 +354,44 @@ mm_free(void *p)
 void *
 mm_realloc(void *ptr, size_t size)
 {
-	// Your code here
-	  
-	// Check heap correctness after realloc to catch bugs
-	if (debug) {
-		mm_checkheap(true);
-	}
-	return NULL;
+	 // If ptr is NULL, equivalent to malloc(size)
+    if (ptr == NULL) {
+        return mm_malloc(size);
+    }
+ 
+    // If size is 0, equivalent to free(ptr)
+    if (size == 0) {
+        mm_free(ptr);
+        if (debug) {
+            mm_checkheap(true);
+        }
+        return NULL;
+    }
+ 
+    // Allocate a new block of the requested size
+    void *new_ptr = mm_malloc(size);
+    if (new_ptr == NULL) {
+        return NULL;
+    }
+ 
+    // Copy contents — minimum of old payload size and new payload size
+    meta_t *old_header = payload2header(ptr);
+    size_t old_payload_size = get_size(old_header) - 2 * hdr_size;
+    size_t new_payload_size = align(size);
+    size_t copy_size = old_payload_size < new_payload_size
+                       ? old_payload_size
+                       : new_payload_size;
+ 
+    memmove(new_ptr, ptr, copy_size);
+ 
+    // Free the old block
+    mm_free(ptr);
+ 
+    // Check heap correctness after realloc to catch bugs
+    if (debug) {
+        mm_checkheap(true);
+    }
+    return new_ptr;
 }
 
 
